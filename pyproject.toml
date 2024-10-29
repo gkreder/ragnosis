@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project.urls]
+"Homepage" = "https://github.com/gkreder/ragnosis"
+"Source Code" = "https://github.com/gkreder/ragnosis"
+"Bug Tracker" = "https://github.com/gkreder/ragnosis/issues"
+
+[project]
+name = "ragnosis"
+version = "0.1.0"
+description = "LLM-retrieval based knowledge grounding"
+authors = [
+  { name = "gkreder", email = "gk@reder.io" }
+]
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.8"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+dependencies = [
+  "python-dotenv==1.0.1",
+  "openai>=1.48.0,<2",
+  "langchain>=0.3.0,<0.4",
+  "streamlit==1.37",
+  "beautifulsoup4>=4.12.3,<5",
+  "rdflib==7.0.0",
+  "langchain-community>=0.3.0,<0.4",
+  "langchain-ollama>=0.2.0,<0.3",
+  "fastembed>=0.3.6,<0.4",
+  "faiss-cpu>=1.8.0.post1,<2",
+  "langchain-openai>=0.2.0,<0.3",
+  "pymupdf>=1.24.10,<2",
+  "sentence-transformers>=3.1.1,<4",
+  "langchain-huggingface>=0.1.0,<0.2",
+  "langgraph>=0.2.34,<0.3",
+  "markdown>=3.7,<4",
+  "pdfkit>=1.0.0,<2",
+]
+
+[project.optional-dependencies]
+# Include any optional dependencies here if needed
