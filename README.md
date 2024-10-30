@@ -4,7 +4,7 @@
 
 # Installation
 
-This project relies on [langchain-rdf](https://github.com/vemonet/langchain-rdf) developed by [Vincent Emonet](https://github.com/vemonet/)
+This project relies on [langchain-rdf](https://github.com/vemonet/langchain-rdf) which should be installed separately.
 
 To install langchain-rdf run:
 

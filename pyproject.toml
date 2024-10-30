@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ragnosis"
-version = "0.1.2"
+version = "0.1.5"
 description = "LLM-retrieval based knowledge grounding"
 authors = [
   { name = "gkreder", email = "gk@reder.io" }
@@ -44,3 +44,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+
+[project.scripts]
+ragnosis = "ragnosis.grounding:main"
