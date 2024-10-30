@@ -6,11 +6,8 @@ import textwrap
 from pathlib import Path
 import argparse
 import sys
-import os
-from tqdm.auto import tqdm
 import markdown
 import pdfkit
-import json
 from typing import Dict
 import yaml
 
@@ -18,7 +15,7 @@ from langchain.output_parsers import PydanticOutputParser, RetryOutputParser
 from langchain_core.output_parsers.string import StrOutputParser
 from langchain.prompts.prompt import PromptTemplate
 from langchain.schema import format_document
-from langchain_core.runnables import RunnableLambda, RunnablePassthrough, RunnableParallel
+from langchain_core.runnables import RunnableLambda, RunnableParallel
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_core.vectorstores.base import VectorStoreRetriever
 

@@ -1,7 +1,6 @@
 ###############################################################################
 # gk@reder.io
 ###############################################################################
-from operator import itemgetter
 from typing import Dict, List
 from pathlib import Path
 import logging
