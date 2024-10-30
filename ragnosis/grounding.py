@@ -256,84 +256,11 @@ def ground_hypothesis_flow(input : str, yaml_map_path : Path,
     logging.info(f"Output saved to {out_md} & {out_pdf}")
     return out_string
 
-
-def evaluate_hypothesis_flow(reference_hypothesis: str, test_hypothesis: str, 
-                             model: str, temperature: float = 0.0,
-                             out_md: Path = None) -> HypothesisEvaluation:
-    llm = get_llm(model, kwargs={'temperature': temperature})
-    
-    evaluation_template = textwrap.dedent("""\
-    Compare the following two scientific hypotheses and evaluate how well the test hypothesis fits the reference hypothesis.
-    
-    Reference Hypothesis: ```{reference_hypothesis}```
-                                          
-    Test Hypothesis: ```{test_hypothesis}```
-    
-    Provide a score from 1 to 3, where:
-    1 = Poor fit (significant differences or missing key elements)
-    2 = Moderate fit (some similarities but notable differences)
-    3 = Excellent fit (very similar or equivalent hypotheses)
-    
-    {format_instructions}
-    
-    Evaluation:
-    """)
-
-    evaluation_parser = PydanticOutputParser(pydantic_object=HypothesisEvaluation)
-    evaluation_prompt = PromptTemplate(
-        template=evaluation_template,
-        input_variables=["reference_hypothesis", "test_hypothesis"],
-        partial_variables={'format_instructions': evaluation_parser.get_format_instructions()}
-    )
-
-    retry_parser = RetryOutputParser.from_llm(parser=evaluation_parser, llm=llm)
-    chain = evaluation_prompt | llm | StrOutputParser()
-    retry_chain = RunnableParallel(
-        completion=chain, prompt_value=evaluation_prompt
-    ) | RunnableLambda(lambda x: retry_parser.parse_with_prompt(**x))
-
-    evaluation = retry_chain.invoke({
-        "reference_hypothesis": reference_hypothesis,
-        "test_hypothesis": test_hypothesis
-    })
-
-    print(f"Score: {evaluation.score}")
-    print(f"Explanation: {evaluation.explanation}")
-    
-    if out_md:
-        out_md = Path(out_md)
-        out_dir = out_md.parent
-        if not out_dir.exists():
-            out_dir.mkdir(parents=True)
-        
-        out_string = f"""# Hypothesis Evaluation
-
-## Reference Hypothesis
-
-{reference_hypothesis}
-
-## Test Hypothesis
-
-{test_hypothesis}
-
-## Evaluation
-
-- Score: {evaluation.score}
-- Explanation: {evaluation.explanation}
-"""
-        
-        with open(out_md, "w") as f:
-            f.write(out_string)
-        
-        logging.info(f"Output saved to {out_md}")
-
-    return evaluation
-
 ###############################################################################
 # Main function for command line running
 ###############################################################################
 def get_parser():
-    parser = argparse.ArgumentParser(description="Hypothesis compilation tool")
+    parser = argparse.ArgumentParser(description="Ragnosis scientific knowledge grounding")
     
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
     
@@ -359,14 +286,6 @@ def get_parser():
     hypothesis_extraction_parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the LLM model")
     hypothesis_extraction_parser.add_argument("--out_file", type=Path, default=None, help="Optional file to save the extracted hypothesis (.txt)")
 
-    # Add new subcommand for evaluating hypotheses
-    evaluate_hypothesis_parser = subparsers.add_parser("evaluate_hypothesis", help="Evaluates a test hypothesis against a reference hypothesis")
-    evaluate_hypothesis_parser.add_argument("reference_hypothesis", type=str, help="Reference hypothesis")
-    evaluate_hypothesis_parser.add_argument("test_hypothesis", type=str, help="Test hypothesis")
-    evaluate_hypothesis_parser.add_argument("--model", type=str, default="openai/gpt-4o", help="LLM model to use for the evaluation")
-    evaluate_hypothesis_parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the LLM model")
-    evaluate_hypothesis_parser.add_argument("--out_md", type=Path, default=None, help="Optional file to save the evaluation results (.md)")
-
     return parser
 
 def main():
@@ -383,7 +302,6 @@ def main():
         "create_index": create_vector_store,
         "ground_hypothesis" : ground_hypothesis_flow,
         "extract_hypothesis" : extract_hypothesis_flow,
-        "evaluate_hypothesis": evaluate_hypothesis_flow,
     }
     if args.command in command_map:
         command_args = {k : v for k, v in vars(args).items() if k != "command"}
