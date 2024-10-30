@@ -125,10 +125,10 @@ def main():
     ############################################################################
     # Testing creation and loading the vector store from multiple owl files
     ############################################################################
-    index_dir = "/Users/gkreder/Downloads/2024-10-02_onto_rag_index"
+    index_dir = "vector_store_dir"
     owl_files = [
-        Path('/Users/gkreder/gdrive/medium-boat/ontologies/obi.owl'),
-        Path('/Users/gkreder/gdrive/medium-boat/ontologies/so.owl')
+        Path('apo.owl'),
+        Path('go-plus.owl')
                  ]
     
     vector_store = create_vector_store(Path(index_dir), owl_files)
