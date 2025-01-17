@@ -11,6 +11,11 @@ import pdfkit
 from typing import Dict
 import yaml
 
+# Workaround for the OpenMP forking error - needs more permanent fix
+# See https://stackoverflow.com/questions/53014306/error-15-initializing-libiomp5-dylib-but-found-libiomp5-dylib-already-initial
+import os
+os.environ['KMP_DUPLICATE_LIB_OK']='True'
+
 from langchain.output_parsers import PydanticOutputParser, RetryOutputParser
 from langchain_core.output_parsers.string import StrOutputParser
 from langchain.prompts.prompt import PromptTemplate
@@ -18,8 +23,10 @@ from langchain.schema import format_document
 from langchain_core.runnables import RunnableLambda, RunnableParallel
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_core.vectorstores.base import VectorStoreRetriever
+from langchain.chat_models.base import BaseChatModel
 
-from ragnosis.models import GroundedEntity, HypothesisEntities, ExtractedHypothesis, SearchTerm, GroundedEntityWithSearchTerm, HypothesisEvaluation
+
+from ragnosis.models import GroundedEntity, HypothesisEntities, ExtractedHypothesis, SearchTerm, GroundedEntityWithSearchTerm, HypothesisEvaluation, ExperimentPlan
 from ragnosis.aux import get_llm, load_vector_stores_yaml, create_vector_store
 
 
@@ -256,6 +263,230 @@ def ground_hypothesis_flow(input : str, yaml_map_path : Path,
     logging.info(f"Output saved to {out_md} & {out_pdf}")
     return out_string
 
+def ground_experiment_plan(experiment_plan: ExperimentPlan, 
+                         yaml_map_path: Path,
+                         model: str, 
+                         temperature: float = 0.0) -> Dict[str, Dict[str, GroundedEntityWithSearchTerm]]:
+    """
+    Ground each field in the ExperimentPlan to ontology terms based on the yaml mapping.
+    Returns a dictionary mapping field names to their grounded entities.
+    """
+    # Load vector stores from yaml
+    yaml_map_path = Path(yaml_map_path)
+    vector_store_map = load_vector_stores_yaml(yaml_map_path)
+    
+    # Check yaml compatibility with ExperimentPlan fields
+    experiment_plan_keys = set(ExperimentPlan.__fields__.keys())
+    yaml_keys = set(vector_store_map.keys())
+    if not yaml_keys.issubset(experiment_plan_keys):
+        raise ValueError(f"YAML contains unrecognized experiment plan object keys: {yaml_keys - experiment_plan_keys}")
+    # if not experiment_plan_keys.issubset(yaml_keys):
+    #     raise ValueError(f"YAML map missing required keys: {experiment_plan_keys - yaml_keys}")
+    
+    llm = get_llm(model, kwargs={'temperature': temperature})
+    grounded_fields = {}
+    
+    # Ground each field's entities using the corresponding vector store
+    for field_name, entities in experiment_plan.dict().items():
+        if not entities:  # Skip empty fields
+            continue
+        if field_name not in yaml_keys: # Skip fields that shouldn't be grounded
+            continue
+            
+        retriever = vector_store_map[field_name].as_retriever(search_kwargs={"k": RETRIEVER_TOP_K})
+        field_groundings = {}
+        
+        for entity in entities:
+            # Get search term
+            search_term = get_search_term(entity=entity, llm=llm)
+            
+            # Ground entity using search term
+            grounded_entity = ground_single_entity(
+                entity=entity,
+                search_term=search_term,
+                retriever=retriever,
+                llm=llm
+            )
+            
+            field_groundings[entity] = grounded_entity
+            
+        grounded_fields[field_name] = field_groundings
+        
+    return grounded_fields
+
+def get_search_term(entity: str, llm: BaseChatModel) -> str:
+    """Get a search term for an entity to use for ontology lookup"""
+    search_term_template = textwrap.dedent("""\
+    Given the following entity, decide on a search term that will be used to retrieve \
+    the most appropriate ontology term from a database of ontology terms. \
+    Your decided search term may be the same as the entity, or it may be a more general/specific term.
+
+    {format_instructions}
+                                       
+    Entity: ```{entity}```
+    
+    Response:""")
+    
+    search_term_parser = PydanticOutputParser(pydantic_object=SearchTerm)
+    search_term_retry_parser = RetryOutputParser.from_llm(parser=search_term_parser, llm=llm)
+    
+    search_term_prompt = PromptTemplate(
+        template=search_term_template,
+        input_variables=["entity"],
+        partial_variables={"format_instructions": search_term_parser.get_format_instructions()}
+    )
+    
+    search_term_instance = search_term_prompt | llm | StrOutputParser()
+    search_term_retry_instance = RunnableParallel(
+        completion=search_term_instance, 
+        prompt_value=search_term_prompt
+    ) | RunnableLambda(lambda x: search_term_retry_parser.parse_with_prompt(**x))
+    
+    search_term = search_term_retry_instance.invoke({"entity": entity})
+    return search_term.search_term
+
+def ground_single_entity(
+    entity: str,
+    search_term: str,
+    retriever: VectorStoreRetriever,
+    llm: BaseChatModel
+) -> GroundedEntityWithSearchTerm:
+    """Ground a single entity to an ontology term"""
+    grounding_template = textwrap.dedent("""\
+    Given the following entity, find the best-fit ontology term to ground this entity. \
+    Use your best judgement to select the most apt term from the ontology. \
+    Base your decision ONLY on the retrieved ontology context below.
+        
+    retrieved context: ```{context}```
+    
+    {format_instructions}
+                                         
+    Entity: ```{entity}```
+                                         
+    Response:""")
+
+    document_format_prompt = PromptTemplate.from_template(
+        template="Concept label: {page_content} | URI: {uri} | Type: {type} | Predicate: {predicate} | Ontology: {ontology}"
+    )
+    
+    def _combine_documents(docs, document_prompt=document_format_prompt, document_separator="\n\n"):
+        doc_strings = [format_document(doc, document_prompt) for doc in docs]
+        return document_separator.join(doc_strings)
+
+    grounding_parser = PydanticOutputParser(pydantic_object=GroundedEntity)
+    grounding_retry_parser = RetryOutputParser.from_llm(parser=grounding_parser, llm=llm)
+    
+    retrieved_docs = retriever.invoke(search_term)
+    context = _combine_documents(retrieved_docs)
+    
+    grounding_prompt = PromptTemplate(
+        template=grounding_template,
+        input_variables=["entity"],
+        partial_variables={
+            "format_instructions": grounding_parser.get_format_instructions(),
+            "context": context
+        }
+    )
+    
+    grounding_chain_instance = grounding_prompt | llm | StrOutputParser()
+    grounding_retry_instance = RunnableParallel(
+        completion=grounding_chain_instance,
+        prompt_value=grounding_prompt
+    ) | RunnableLambda(lambda x: grounding_retry_parser.parse_with_prompt(**x))
+    
+    grounded_entity = grounding_retry_instance.invoke({"entity": entity})
+    return GroundedEntityWithSearchTerm(**grounded_entity.dict(), search_term=search_term)
+
+def generate_experiment_plan_flow(
+    input: str,
+    yaml_map_path: Path,
+    model: str,
+    temperature: float = 0.0,
+    out_md: Path = None,
+) -> str:
+    """Main flow to generate and ground an experiment plan"""
+    
+    # First generate the experiment plan with entities
+    llm = get_llm(model, kwargs={'temperature': temperature})
+    
+    plan_template = textwrap.dedent("""\
+    Given the following scientific hypothesis, generate a detailed experiment plan to test the hypothesis. \
+    For each field, extract key entities (techniques, reagents, controls, etc.) as a list.
+
+    {format_instructions}
+    
+    Hypothesis: ```{hypothesis}```
+    
+    Response:""")
+    
+    plan_parser = PydanticOutputParser(pydantic_object=ExperimentPlan)
+    plan_retry_parser = RetryOutputParser.from_llm(parser=plan_parser, llm=llm)
+    
+    plan_prompt = PromptTemplate(
+        template=plan_template,
+        input_variables=["hypothesis"],
+        partial_variables={"format_instructions": plan_parser.get_format_instructions()}
+    )
+    
+    plan_chain = plan_prompt | llm | StrOutputParser()
+    plan_retry_chain = RunnableParallel(
+        completion=plan_chain,
+        prompt_value=plan_prompt
+    ) | RunnableLambda(lambda x: plan_retry_parser.parse_with_prompt(**x))
+    
+    experiment_plan = plan_retry_chain.invoke({"hypothesis": input})
+    
+    # Ground the entities in the plan
+    grounded_plan = ground_experiment_plan(
+        experiment_plan=experiment_plan,
+        yaml_map_path=yaml_map_path,
+        model=model,
+        temperature=temperature
+    )
+    
+    # Generate output
+    out_string = textwrap.dedent(f"""\
+    # Input Hypothesis
+    
+    {input}\n
+    
+    # Generated Experiment Plan\n""")
+    
+    # Handle all fields from the experiment plan
+    for field_name, value in experiment_plan.dict().items():
+        out_string += f"## {field_name.replace('_', ' ').title()}\n\n"
+        
+        if isinstance(value, str):
+            # Handle string fields
+            out_string += f"{value}\n\n"
+        elif isinstance(value, list):
+            # Handle list fields
+            if not value:
+                out_string += "No entities extracted\n\n"
+                continue
+                
+            for entity in value:
+                out_string += f"### {entity}\n"
+                if field_name in grounded_plan and entity in grounded_plan[field_name]:
+                    grounded_entity = grounded_plan[field_name][entity]
+                    for k, v in grounded_entity.__dict__.items():
+                        out_string += f"- {k}: {v}\n"
+                out_string += "\n"
+    
+    if out_md:
+        out_md = Path(out_md)
+        out_dir = out_md.parent
+        if not out_dir.exists():
+            out_dir.mkdir(parents=True)
+        with open(out_md, "w") as f:
+            print(out_string, file=f)
+        html_content = markdown.markdown(out_string)
+        out_pdf = out_dir / (out_md.stem + ".pdf")
+        pdfkit.from_string(html_content, out_pdf)
+        logging.info(f"Output saved to {out_md} & {out_pdf}")
+    
+    return out_string
+
 ###############################################################################
 # Main function for command line running
 ###############################################################################
@@ -286,6 +517,14 @@ def get_parser():
     hypothesis_extraction_parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the LLM model")
     hypothesis_extraction_parser.add_argument("--out_file", type=Path, default=None, help="Optional file to save the extracted hypothesis (.txt)")
 
+    # Subcommand for experiment plan generation
+    experiment_plan_parser = subparsers.add_parser("generate_experiment_plan", help="Generate and ground an experiment plan from a hypothesis")
+    experiment_plan_parser.add_argument("input", type=str, help="Input hypothesis text")
+    experiment_plan_parser.add_argument("yaml_map_path", type=Path, help="Path to the YAML map of vector stores")
+    experiment_plan_parser.add_argument("--model", type=str, default="openai/gpt-4", help="LLM model to use")
+    experiment_plan_parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the LLM model")
+    experiment_plan_parser.add_argument("--out_md", type=Path, default=None, help="Output file to save the results (.md)")
+
     return parser
 
 def main():
@@ -302,6 +541,7 @@ def main():
         "create_index": create_vector_store,
         "ground_hypothesis" : ground_hypothesis_flow,
         "extract_hypothesis" : extract_hypothesis_flow,
+        "generate_experiment_plan" : generate_experiment_plan_flow,
     }
     if args.command in command_map:
         command_args = {k : v for k, v in vars(args).items() if k != "command"}
