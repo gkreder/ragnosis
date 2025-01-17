@@ -26,7 +26,7 @@ from langchain_core.vectorstores.base import VectorStoreRetriever
 from langchain.chat_models.base import BaseChatModel
 
 
-from ragnosis.models import GroundedEntity, HypothesisEntities, ExtractedHypothesis, SearchTerm, GroundedEntityWithSearchTerm, HypothesisEvaluation, ExperimentPlan
+from ragnosis.models import GroundedEntity, HypothesisEntities, ExtractedHypothesis, SearchTerm, GroundedEntityWithSearchTerm, HypothesisEvaluation, ExperimentPlan, Protocol
 from ragnosis.aux import get_llm, load_vector_stores_yaml, create_vector_store
 
 
@@ -487,6 +487,83 @@ def generate_experiment_plan_flow(
     
     return out_string
 
+def generate_protocol_flow(
+    input_md: Path,
+    model: str,
+    temperature: float = 0.0,
+    out_md: Path = None,
+) -> str:
+    """Generate a detailed experimental protocol from an experiment plan markdown file"""
+    
+    # Read the experiment plan markdown
+    input_md = Path(input_md)
+    if not input_md.exists():
+        raise ValueError(f"Input file {input_md} does not exist")
+    
+    with open(input_md, "r") as f:
+        experiment_plan_text = f.read()
+    
+    # Create LLM instance
+    llm = get_llm(model, kwargs={'temperature': temperature})
+    
+    protocol_template = textwrap.dedent("""\
+    Given the following experiment plan, generate a detailed laboratory protocol that a graduate student could follow.
+    The protocol should be specific, actionable, and include all necessary details for successful execution.
+    
+    {format_instructions}
+    
+    Experiment Plan:
+    ```
+    {experiment_plan}
+    ```
+    
+    Protocol:""")
+    
+    protocol_parser = PydanticOutputParser(pydantic_object=Protocol)
+    protocol_retry_parser = RetryOutputParser.from_llm(parser=protocol_parser, llm=llm)
+    
+    protocol_prompt = PromptTemplate(
+        template=protocol_template,
+        input_variables=["experiment_plan"],
+        partial_variables={"format_instructions": protocol_parser.get_format_instructions()}
+    )
+    
+    protocol_chain = protocol_prompt | llm | StrOutputParser()
+    protocol_retry_chain = RunnableParallel(
+        completion=protocol_chain,
+        prompt_value=protocol_prompt
+    ) | RunnableLambda(lambda x: protocol_retry_parser.parse_with_prompt(**x))
+    
+    protocol = protocol_retry_chain.invoke({"experiment_plan": experiment_plan_text})
+    
+    # Generate markdown dynamically based on Protocol model fields
+    sections = []
+    for field_name, field_value in protocol.dict().items():
+        # Convert field_name from snake_case to Title Case
+        section_title = field_name.replace('_', ' ').title()
+        
+        if isinstance(field_value, str):
+            sections.append(f"## {section_title}\n{field_value}\n")
+        elif isinstance(field_value, list):
+            items = '\n'.join([f"- {item}" for item in field_value])
+            sections.append(f"## {section_title}\n{items}\n")
+    
+    out_string = '\n'.join(sections)
+    
+    if out_md:
+        out_md = Path(out_md)
+        out_dir = out_md.parent
+        if not out_dir.exists():
+            out_dir.mkdir(parents=True)
+        with open(out_md, "w") as f:
+            print(out_string, file=f)
+        html_content = markdown.markdown(out_string)
+        out_pdf = out_dir / (out_md.stem + ".pdf")
+        pdfkit.from_string(html_content, out_pdf)
+        logging.info(f"Output saved to {out_md} & {out_pdf}")
+    
+    return out_string
+
 ###############################################################################
 # Main function for command line running
 ###############################################################################
@@ -525,6 +602,13 @@ def get_parser():
     experiment_plan_parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the LLM model")
     experiment_plan_parser.add_argument("--out_md", type=Path, default=None, help="Output file to save the results (.md)")
 
+    # Subcommand for generating a detailed experimental protocol
+    protocol_parser = subparsers.add_parser("generate_protocol", help="Generate a detailed experimental protocol from an experiment plan markdown file")
+    protocol_parser.add_argument("input_md", type=Path, help="Path to the experiment plan markdown file")
+    protocol_parser.add_argument("--model", type=str, default="openai/gpt-4", help="LLM model to use")
+    protocol_parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the LLM model")
+    protocol_parser.add_argument("--out_md", type=Path, default=None, help="Output file to save the results (.md)")
+
     return parser
 
 def main():
@@ -542,6 +626,7 @@ def main():
         "ground_hypothesis" : ground_hypothesis_flow,
         "extract_hypothesis" : extract_hypothesis_flow,
         "generate_experiment_plan" : generate_experiment_plan_flow,
+        "generate_protocol" : generate_protocol_flow,
     }
     if args.command in command_map:
         command_args = {k : v for k, v in vars(args).items() if k != "command"}
