@@ -507,7 +507,7 @@ def generate_protocol_flow(
     llm = get_llm(model, kwargs={'temperature': temperature})
     
     protocol_template = textwrap.dedent("""\
-    Given the following experiment plan, generate a detailed laboratory protocol that a graduate student could follow.
+    Given the following experiment plan, generate a detailed laboratory protocol that a laboratory technician could easily follow and execute.
     The protocol should be specific, actionable, and include all necessary details for successful execution.
     
     {format_instructions}
@@ -637,4 +637,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    
 

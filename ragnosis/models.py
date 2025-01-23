@@ -64,12 +64,13 @@ class ExperimentPlan(BaseModel):
     # potential_pitfalls: List[str] = Field(description="Potential challenge entities in experiment design")
 
 class Protocol(BaseModel):
-    """A detailed experimental protocol derived from an experiment plan. Each step should be clear and actionable. The protocol should have enough detail that a graduate student could easily execute it."""
+    """A detailed experimental protocol derived from an experiment plan. Each step should be clear and actionable. The protocol should have enough detail that a laboratory technician could easily execute it."""
     title: str = Field(description="Title of the protocol")
     hypothesis: str =  Field(description="The hypothesis the protocol is testing")
     description: str = Field(description="Brief description of the protocol's purpose and reasoning")
     materials_needed: List[str] = Field(description="List of required materials and reagents, including any ontology grounding IDs if provided")
     equipment_needed: List[str] = Field(description="List of required equipment, including any ontology grounding IDs if provided")
     steps: List[str] = Field(description="Detailed step-by-step instructions. Each step should be clear and actionable.")
+    
     
 
