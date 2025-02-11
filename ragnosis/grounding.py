@@ -515,21 +515,33 @@ def generate_protocol_flow(
     logging.info(f"Starting protocol generation workflow. Logging to {log_file}")
     
     try:
-        # Read the experiment plan markdown
-        input_md = Path(input_md)
-        if not input_md.exists():
-            logging.error(f"Input file not found: {input_md}")
-            raise ValueError(f"Input file {input_md} does not exist")
+        # Read and parse the experiment plan markdown
+        with open(input_md, "r") as f:
+            experiment_plan_text = f.read()
         
-        logging.info(f"Reading experiment plan from {input_md}")
-        try:
-            with open(input_md, "r") as f:
-                experiment_plan_text = f.read()
-            logging.debug(f"Successfully read {len(experiment_plan_text)} characters from input file")
-        except Exception as e:
-            logging.error(f"Failed to read experiment plan file: {e}")
-            raise
+        # Extract Assay Types and Organisms sections from input markdown
+        assay_types_section = ""
+        organisms_section = ""
+        current_section = None
         
+        for line in experiment_plan_text.split('\n'):
+            if line.startswith('## Assay Types'):
+                current_section = 'assay_types'
+                continue
+            elif line.startswith('## Organisms'):
+                current_section = 'organisms'
+                continue
+            elif line.startswith('## '):
+                current_section = None
+                continue
+            elif current_section == 'assay_types':
+                assay_types_section += line + '\n'
+            elif current_section == 'organisms':
+                organisms_section += line + '\n'
+        
+        logging.debug(f"Extracted assay types section: {len(assay_types_section)} characters")
+        logging.debug(f"Extracted organisms section: {len(organisms_section)} characters")
+
         # Create LLM instance
         logging.info(f"Initializing LLM model: {model} (temperature={temperature})")
         try:
@@ -589,6 +601,8 @@ def generate_protocol_flow(
         logging.info("Formatting protocol output")
         try:
             sections = []
+            
+            # Add protocol sections
             for field_name, field_value in protocol.dict().items():
                 section_title = field_name.replace('_', ' ').title()
                 logging.debug(f"Processing section: {section_title}")
@@ -598,6 +612,12 @@ def generate_protocol_flow(
                 elif isinstance(field_value, list):
                     items = '\n'.join([f"- {item}" for item in field_value])
                     sections.append(f"## {section_title}\n{items}\n")
+            
+            # Add Assay Types and Organisms sections from input if they exist
+            if assay_types_section.strip():
+                sections.append(f"## Assay Types\n{assay_types_section}\n")
+            if organisms_section.strip():
+                sections.append(f"## Organisms\n{organisms_section}\n")
             
             out_string = '\n'.join(sections)
             logging.debug(f"Generated markdown output with {len(sections)} sections")
@@ -690,7 +710,7 @@ def get_parser():
 def main():
     # Set up logging configuration for console output
     logging.basicConfig(
-        level=logging.DEBUG,  # Change to logging.DEBUG for more detailed output
+        level=logging.INFO,  # Change to logging.DEBUG for more detailed output
         format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
         handlers=[
             logging.StreamHandler(sys.stdout)
