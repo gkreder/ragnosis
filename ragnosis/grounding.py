@@ -8,8 +8,9 @@ import argparse
 import sys
 import markdown
 import pdfkit
-from typing import Dict
+from typing import Dict, Tuple
 import yaml
+import json
 
 # Workaround for the OpenMP forking error - needs more permanent fix
 # See https://stackoverflow.com/questions/53014306/error-15-initializing-libiomp5-dylib-but-found-libiomp5-dylib-already-initial
@@ -24,9 +25,10 @@ from langchain_core.runnables import RunnableLambda, RunnableParallel
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_core.vectorstores.base import VectorStoreRetriever
 from langchain.chat_models.base import BaseChatModel
+from pydantic import BaseModel
 
 
-from ragnosis.models import GroundedEntity, HypothesisEntities, ExtractedHypothesis, SearchTerm, GroundedEntityWithSearchTerm, HypothesisEvaluation, ExperimentPlan, Protocol
+from ragnosis.models import GroundedEntity, HypothesisEntities, ExtractedHypothesis, SearchTerm, GroundedEntityWithSearchTerm, HypothesisEvaluation, ExperimentPlan, Protocol, GroundedItem
 from ragnosis.aux import get_llm, load_vector_stores_yaml, create_vector_store
 
 
@@ -266,14 +268,16 @@ def ground_hypothesis_flow(input : str, yaml_map_path : Path,
     logging.info(f"Output saved to {out_md} & {out_pdf}")
     return out_string
 
-def ground_experiment_plan(experiment_plan: ExperimentPlan, 
-                         yaml_map_path: Path,
-                         model: str, 
-                         temperature: float = 0.0) -> Dict[str, Dict[str, GroundedEntityWithSearchTerm]]:
+def ground_experiment_plan(
+    experiment_plan: ExperimentPlan, 
+    yaml_map_path: Path,
+    model: str, 
+    temperature: float = 0.0
+) -> ExperimentPlan:
+    """Ground each field in the ExperimentPlan to ontology terms based on the yaml mapping.
+    Returns an updated ExperimentPlan with grounded entities.
     """
-    Ground each field in the ExperimentPlan to ontology terms based on the yaml mapping.
-    Returns a dictionary mapping field names to their grounded entities.
-    """
+    
     # Load vector stores from yaml
     yaml_map_path = Path(yaml_map_path)
     vector_store_map = load_vector_stores_yaml(yaml_map_path)
@@ -283,39 +287,56 @@ def ground_experiment_plan(experiment_plan: ExperimentPlan,
     yaml_keys = set(vector_store_map.keys())
     if not yaml_keys.issubset(experiment_plan_keys):
         raise ValueError(f"YAML contains unrecognized experiment plan object keys: {yaml_keys - experiment_plan_keys}")
-    # if not experiment_plan_keys.issubset(yaml_keys):
-    #     raise ValueError(f"YAML map missing required keys: {experiment_plan_keys - yaml_keys}")
     
     llm = get_llm(model, kwargs={'temperature': temperature})
-    grounded_fields = {}
+    plan_dict = experiment_plan.dict()
+    grounded_plan_dict = {}
     
     # Ground each field's entities using the corresponding vector store
-    for field_name, entities in experiment_plan.dict().items():
-        if not entities:  # Skip empty fields
+    for field_name, value in plan_dict.items():
+        if not value:  # Skip empty fields
+            grounded_plan_dict[field_name] = value
             continue
-        if field_name not in yaml_keys: # Skip fields that shouldn't be grounded
+        if field_name not in yaml_keys:  # Skip fields that shouldn't be grounded
+            grounded_plan_dict[field_name] = value
             continue
             
         retriever = vector_store_map[field_name].as_retriever(search_kwargs={"k": RETRIEVER_TOP_K})
-        field_groundings = {}
         
-        for entity in entities:
-            # Get search term
-            search_term = get_search_term(entity=entity, llm=llm)
+        if isinstance(value, list):
+            grounded_items = []
+            for item in value:
+                try:
+                    # Handle case where item might be a dict or string
+                    item_value = item['value'] if isinstance(item, dict) else str(item)
+                    
+                    # Get search term
+                    search_term = get_search_term(entity=item_value, llm=llm)
+                    
+                    # Ground entity using search term
+                    grounded_entity = ground_single_entity(
+                        entity=item_value,
+                        search_term=search_term,
+                        retriever=retriever,
+                        llm=llm
+                    )
+                    
+                    grounded_items.append(GroundedItem(
+                        value=item_value,
+                        grounding=grounded_entity
+                    ))
+                except Exception as e:
+                    logging.warning(f"Failed to ground item '{item}' in field '{field_name}': {e}")
+                    # If grounding fails, still include the item but without grounding
+                    grounded_items.append(GroundedItem(
+                        value=str(item),
+                        grounding=None
+                    ))
+            grounded_plan_dict[field_name] = grounded_items
+        else:
+            grounded_plan_dict[field_name] = value
             
-            # Ground entity using search term
-            grounded_entity = ground_single_entity(
-                entity=entity,
-                search_term=search_term,
-                retriever=retriever,
-                llm=llm
-            )
-            
-            field_groundings[entity] = grounded_entity
-            
-        grounded_fields[field_name] = field_groundings
-        
-    return grounded_fields
+    return ExperimentPlan(**grounded_plan_dict)
 
 def get_search_term(entity: str, llm: BaseChatModel) -> str:
     """Get a search term for an entity to use for ontology lookup"""
@@ -400,63 +421,154 @@ def ground_single_entity(
     grounded_entity = grounding_retry_instance.invoke({"entity": entity})
     return GroundedEntityWithSearchTerm(**grounded_entity.dict(), search_term=search_term)
 
+def format_model_to_markdown(obj: BaseModel, level: int = 1) -> list[str]:
+    """Convert a Pydantic model to markdown format recursively.
+    
+    Args:
+        obj: A Pydantic model instance
+        level: The current header level (1 = #, 2 = ##, etc.)
+    
+    Returns:
+        List of markdown formatted strings
+    """
+    output = []
+    
+    # Handle different types
+    if isinstance(obj, BaseModel):
+        # Get all fields from the model
+        for field_name, field_value in obj.dict().items():
+            # Add field header
+            header = "#" * level
+            output.append(f"{header} {field_name.replace('_', ' ').title()}")
+            output.append("")
+            
+            # Format the field value
+            if isinstance(field_value, str):
+                output.append(field_value)
+            elif isinstance(field_value, list):
+                if not field_value:
+                    output.append("None specified")
+                else:
+                    for item in field_value:
+                        if isinstance(item, dict) and 'value' in item:  # GroundedItem
+                            output.append(f"### {item['value']}")
+                            if item.get('grounding'):
+                                output.append("Grounding Information:")
+                                for k, v in item['grounding'].items():
+                                    output.append(f"- {k.replace('_', ' ').title()}: {v}")
+                        elif isinstance(item, BaseModel):
+                            output.extend(format_model_to_markdown(item, level + 1))
+                        else:
+                            output.append(f"- {item}")
+                        output.append("")
+            elif isinstance(field_value, dict):
+                for k, v in field_value.items():
+                    output.append(f"### {k}")
+                    output.append(str(v))
+                    output.append("")
+            elif isinstance(field_value, BaseModel):
+                output.extend(format_model_to_markdown(field_value, level + 1))
+            else:
+                output.append(str(field_value))
+            output.append("")
+    
+    return output
+
+def save_markdown_and_pdf(output_parts: list[str], out_md: Path, out_pdf: Path):
+    """Save markdown content to both .md and .pdf files with proper formatting."""
+    # Join all parts with newlines for markdown
+    out_string = "\n".join(output_parts)
+    
+    # Save markdown
+    with open(out_md, "w") as f:
+        print(out_string, file=f)
+    
+    # Convert to HTML with proper line breaks
+    html_parts = []
+    for line in output_parts:
+        if line.startswith('#'):
+            # Headers
+            level = len(line.split()[0])
+            text = ' '.join(line.split()[1:])
+            html_parts.append(f"<h{level}>{text}</h{level}>")
+        elif line.startswith('-'):
+            # List items
+            html_parts.append(f"<p>{line}</p>")
+        elif line.strip() == "":
+            # Empty lines
+            html_parts.append("<br/>")
+        else:
+            # Regular text
+            html_parts.append(f"<p>{line}</p>")
+    
+    html_content = "\n".join(html_parts)
+    
+    # Save PDF with proper formatting
+    pdfkit.from_string(html_content, out_pdf, options={
+        'margin-top': '20mm',
+        'margin-right': '20mm',
+        'margin-bottom': '20mm',
+        'margin-left': '20mm'
+    })
+
 def generate_experiment_plan_flow(
-    input: str,
+    hypothesis: str,
     yaml_map_path: Path,
     model: str,
+    output_folder: Path,
+    prefix: str,
+    context: str = None,
     temperature: float = 0.0,
-    out_md: Path = None,
-) -> str:
-    """Main flow to generate and ground an experiment plan"""
+) -> Tuple[str, ExperimentPlan]:
+    """Main flow to generate and ground an experiment plan
     
-    # First generate the restated hypothesis
-    llm = get_llm(model, kwargs={'temperature': temperature})
+    Args:
+        hypothesis: Input hypothesis text
+        yaml_map_path: Path to YAML map of vector stores
+        model: LLM model to use
+        output_folder: Folder to save outputs
+        prefix: Prefix for output files
+        context: Optional additional context for the hypothesis
+        temperature: Temperature for LLM model
+        
+    Returns:
+        Tuple of (markdown output string, experiment plan object)
+    """
     
-    restate_template = """\
-Clearly state the hypothesis, independent and dependent variables, any expected correlations,
-interactions, or causal relationships
-
-- Enhance Context-Gathering: Summarize known biological mechanisms, previous related
-studies, and whether prior experiments have yielded conflicting or inconclusive results.
-Highlight key knowledge gaps this research aims to address.
-
-- Clarify Sensitivity Requirements: Define acceptable detection limits, dynamic range, or
-measurement scales (e.g., molecular, subcellular, cellular, population level) necessary to
-validate the hypothesis.
-
-- Identify Potential Challenges: List anticipated technical or methodological challenges based
-on prior research in this domain (e.g., detection limitations, sample constraints, equipment
-availability).
-
-Original hypothesis: ```{hypothesis}```
-
-Restated hypothesis:"""
+    # Create output directory if it doesn't exist
+    output_folder = Path(output_folder)
+    if not output_folder.exists():
+        output_folder.mkdir(parents=True)
     
-    restate_prompt = PromptTemplate(
-        template=restate_template,
-        input_variables=["hypothesis"]
-    )
+    # Define output paths
+    out_md = output_folder / f"{prefix}_experiment_plan.md"
+    out_pdf = output_folder / f"{prefix}_experiment_plan.pdf"
+    out_json = output_folder / f"{prefix}_experiment_plan.json"
     
-    restate_chain = restate_prompt | llm | StrOutputParser()
-    restated_hypothesis = restate_chain.invoke({"hypothesis": input})
+    # Combine hypothesis and context if provided
+    input_text = hypothesis
+    if context:
+        input_text = f"Hypothesis:\n{hypothesis}\n\nContext:\n{context}"
     
-    # Then generate the experiment plan using the restated hypothesis
+    # Generate the experiment plan using the hypothesis and context
     plan_template = """\
-Given the following scientific hypothesis, generate a detailed experiment plan to test the hypothesis. \
+Given the following input, generate a detailed experiment plan to test the hypothesis. \
 For each field, extract key entities (techniques, reagents, controls, etc.) as a list.
 
 {format_instructions}
 
-Hypothesis: ```{restated_hypothesis}```
+Input: ```{input_text}```
 
 Response:"""
+
+    llm = get_llm(model, kwargs={'temperature': temperature})
     
     plan_parser = PydanticOutputParser(pydantic_object=ExperimentPlan)
     plan_retry_parser = RetryOutputParser.from_llm(parser=plan_parser, llm=llm)
     
     plan_prompt = PromptTemplate(
         template=plan_template,
-        input_variables=["restated_hypothesis"],
+        input_variables=["input_text"],
         partial_variables={"format_instructions": plan_parser.get_format_instructions()}
     )
     
@@ -466,7 +578,7 @@ Response:"""
         prompt_value=plan_prompt
     ) | RunnableLambda(lambda x: plan_retry_parser.parse_with_prompt(**x))
     
-    experiment_plan = plan_retry_chain.invoke({"restated_hypothesis": restated_hypothesis})
+    experiment_plan = plan_retry_chain.invoke({"input_text": input_text})
     
     # Ground the entities in the plan
     grounded_plan = ground_experiment_plan(
@@ -476,79 +588,64 @@ Response:"""
         temperature=temperature
     )
     
-    # Generate output - using list of strings to ensure proper formatting
+    # Generate markdown using the model-driven formatter
     output_parts = [
-        "# Input Hypothesis",
+        "# Input",
         "",
-        input,
-        "",
-        "# Restated Hypothesis",
-        "",
-        restated_hypothesis,
+        input_text,
         "",
         "# Generated Experiment Plan",
         ""
     ]
     
-    # Handle all fields from the experiment plan
-    for field_name, value in experiment_plan.dict().items():
-        output_parts.append(f"## {field_name.replace('_', ' ').title()}")
-        output_parts.append("")
-        
-        if isinstance(value, str):
-            # Handle string fields
-            output_parts.append(value)
-            output_parts.append("")
-        elif isinstance(value, list):
-            # Handle list fields
-            if not value:
-                output_parts.append("No entities extracted")
-                output_parts.append("")
-                continue
-                
-            for entity in value:
-                output_parts.append(f"### {entity}")
-                if field_name in grounded_plan and entity in grounded_plan[field_name]:
-                    grounded_entity = grounded_plan[field_name][entity]
-                    for k, v in grounded_entity.__dict__.items():
-                        output_parts.append(f"- {k}: {v}")
-                output_parts.append("")
+    output_parts.extend(format_model_to_markdown(grounded_plan, level=2))
     
-    # Join all parts with newlines
-    out_string = "\n".join(output_parts)
+    # Save outputs with proper formatting
+    save_markdown_and_pdf(output_parts, out_md, out_pdf)
     
-    if out_md:
-        out_md = Path(out_md)
-        out_dir = out_md.parent
-        if not out_dir.exists():
-            out_dir.mkdir(parents=True)
-        with open(out_md, "w") as f:
-            print(out_string, file=f)
-        html_content = markdown.markdown(out_string)
-        out_pdf = out_dir / (out_md.stem + ".pdf")
-        pdfkit.from_string(html_content, out_pdf)
-        logging.info(f"Output saved to {out_md} & {out_pdf}")
+    # Save JSON
+    with open(out_json, "w") as f:
+        json.dump(grounded_plan.dict(), f, indent=2)
     
-    return out_string
+    logging.info(f"Saved outputs to {output_folder}:")
+    logging.info(f"  - Markdown: {out_md}")
+    logging.info(f"  - PDF: {out_pdf}")
+    logging.info(f"  - JSON: {out_json}")
+    
+    return "\n".join(output_parts), grounded_plan
 
 def generate_protocol_flow(
-    input_md: Path,
+    input_json: Path,
     model: str,
+    output_folder: Path,
+    prefix: str,
     temperature: float = 0.0,
-    out_md: Path = None,
-) -> str:
-    """Generate a detailed experimental protocol from an experiment plan markdown file"""
+) -> Tuple[str, Protocol]:
+    """Generate a detailed experimental protocol from a serialized experiment plan
+    
+    Args:
+        input_json: Path to the serialized experiment plan JSON
+        model: LLM model to use
+        output_folder: Folder to save outputs
+        prefix: Prefix for output files
+        temperature: Temperature for LLM model
+        
+    Returns:
+        Tuple of (markdown output string, protocol object)
+    """
+    
+    # Create output directory if it doesn't exist
+    output_folder = Path(output_folder)
+    if not output_folder.exists():
+        output_folder.mkdir(parents=True)
+    
+    # Define output paths
+    out_md = output_folder / f"{prefix}_protocol.md"
+    out_pdf = output_folder / f"{prefix}_protocol.pdf"
+    out_json = output_folder / f"{prefix}_protocol.json"
+    log_file = output_folder / f"{prefix}_protocol.log"
     
     # Set up logging for this run
-    if out_md:
-        out_dir = Path(out_md).parent
-        if not out_dir.exists():
-            out_dir.mkdir(parents=True)
-        log_file = out_dir / "ragnosis_protocol.log"
-    else:
-        log_file = Path("ragnosis_protocol.log")
-    
-    # Add file handler to root logger
     file_handler = logging.FileHandler(log_file)
     file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(name)s - %(message)s'))
     logging.getLogger().addHandler(file_handler)
@@ -556,32 +653,12 @@ def generate_protocol_flow(
     logging.info(f"Starting protocol generation workflow. Logging to {log_file}")
     
     try:
-        # Read and parse the experiment plan markdown
-        with open(input_md, "r") as f:
-            experiment_plan_text = f.read()
+        # Read and parse the experiment plan JSON
+        with open(input_json, "r") as f:
+            experiment_plan_dict = json.load(f)
+            experiment_plan = ExperimentPlan(**experiment_plan_dict)
         
-        # Extract Assay Types and Organisms sections from input markdown
-        assay_types_section = ""
-        organisms_section = ""
-        current_section = None
-        
-        for line in experiment_plan_text.split('\n'):
-            if line.startswith('## Assay Types'):
-                current_section = 'assay_types'
-                continue
-            elif line.startswith('## Organisms'):
-                current_section = 'organisms'
-                continue
-            elif line.startswith('## '):
-                current_section = None
-                continue
-            elif current_section == 'assay_types':
-                assay_types_section += line + '\n'
-            elif current_section == 'organisms':
-                organisms_section += line + '\n'
-        
-        logging.debug(f"Extracted assay types section: {len(assay_types_section)} characters")
-        logging.debug(f"Extracted organisms section: {len(organisms_section)} characters")
+        logging.info("Successfully loaded experiment plan from JSON")
 
         # Create LLM instance
         logging.info(f"Initializing LLM model: {model} (temperature={temperature})")
@@ -598,9 +675,27 @@ def generate_protocol_flow(
             protocol_parser = PydanticOutputParser(pydantic_object=Protocol)
             protocol_retry_parser = RetryOutputParser.from_llm(parser=protocol_parser, llm=llm)
             
+            # Convert experiment plan to a format that includes grounding information in a readable way
+            plan_dict = experiment_plan.dict()
+            formatted_plan = {}
+            for field_name, value in plan_dict.items():
+                if isinstance(value, list) and value and isinstance(value[0], dict) and 'value' in value[0]:
+                    # This is a list of GroundedItems
+                    formatted_items = []
+                    for item in value:
+                        item_str = item['value']
+                        if item.get('grounding'):
+                            grounding = item['grounding']
+                            item_str += f" [Ontology: {grounding['ontology_term']} ({grounding['ontology_id']})]"
+                        formatted_items.append(item_str)
+                    formatted_plan[field_name] = formatted_items
+                else:
+                    formatted_plan[field_name] = value
+
             protocol_template = textwrap.dedent("""\
             Given the following experiment plan, generate a detailed laboratory protocol that would allow a technician to execute the experiment.
             The protocol should be clear, actionable, and complete.
+            When materials, equipment, or controls are mentioned in the protocol, try to use the same terms that were grounded in the experiment plan.
 
             {format_instructions}
 
@@ -631,70 +726,35 @@ def generate_protocol_flow(
         # Generate protocol
         logging.info("Generating protocol from experiment plan")
         try:
-            protocol = protocol_retry_chain.invoke({"experiment_plan": experiment_plan_text})
+            protocol = protocol_retry_chain.invoke({"experiment_plan": json.dumps(formatted_plan, indent=2)})
             logging.info("Protocol generation successful")
             logging.debug(f"Generated protocol with {len(protocol.steps)} steps")
         except Exception as e:
             logging.error(f"Failed to generate protocol: {e}")
             raise
 
-        # Generate markdown output
+        # Generate markdown output using the model-driven formatter
         logging.info("Formatting protocol output")
         try:
-            sections = []
+            output_parts = format_model_to_markdown(protocol, level=2)
+            save_markdown_and_pdf(output_parts, out_md, out_pdf)
             
-            # Add protocol sections
-            for field_name, field_value in protocol.dict().items():
-                section_title = field_name.replace('_', ' ').title()
-                logging.debug(f"Processing section: {section_title}")
-                
-                if isinstance(field_value, str):
-                    sections.append(f"## {section_title}\n{field_value}\n")
-                elif isinstance(field_value, list):
-                    items = '\n'.join([f"- {item}" for item in field_value])
-                    sections.append(f"## {section_title}\n{items}\n")
+            # Save JSON
+            with open(out_json, "w") as f:
+                json.dump(protocol.dict(), f, indent=2)
             
-            # Add Assay Types and Organisms sections from input if they exist
-            if assay_types_section.strip():
-                sections.append(f"## Assay Types\n{assay_types_section}\n")
-            if organisms_section.strip():
-                sections.append(f"## Organisms\n{organisms_section}\n")
-            
-            out_string = '\n'.join(sections)
-            logging.debug(f"Generated markdown output with {len(sections)} sections")
+            out_string = "\n".join(output_parts)
+            logging.debug(f"Generated markdown output with {len(output_parts)} lines")
         except Exception as e:
             logging.error(f"Failed to format protocol output: {e}")
             raise
 
-        # Save output files if requested
-        if out_md:
-            logging.info(f"Saving output to {out_md}")
-            try:
-                out_md = Path(out_md)
-                out_dir = out_md.parent
-                if not out_dir.exists():
-                    logging.debug(f"Creating output directory: {out_dir}")
-                    out_dir.mkdir(parents=True)
-                
-                # Save markdown
-                with open(out_md, "w") as f:
-                    print(out_string, file=f)
-                logging.debug(f"Saved markdown output to {out_md}")
-                
-                # Generate and save PDF
-                logging.info("Converting to PDF")
-                html_content = markdown.markdown(out_string)
-                out_pdf = out_dir / (out_md.stem + ".pdf")
-                pdfkit.from_string(html_content, out_pdf)
-                logging.debug(f"Saved PDF output to {out_pdf}")
-                
-                logging.info(f"Output saved to {out_md} & {out_pdf}")
-            except Exception as e:
-                logging.error(f"Failed to save output files: {e}")
-                raise
+        logging.info(f"Successfully saved all outputs:")
+        logging.info(f"  - Markdown: {out_md}")
+        logging.info(f"  - PDF: {out_pdf}")
+        logging.info(f"  - JSON: {out_json}")
         
-        logging.info("Protocol generation workflow completed successfully")
-        return out_string
+        return out_string, protocol
         
     finally:
         # Clean up the file handler
@@ -733,18 +793,21 @@ def get_parser():
 
     # Subcommand for experiment plan generation
     experiment_plan_parser = subparsers.add_parser("generate_experiment_plan", help="Generate and ground an experiment plan from a hypothesis")
-    experiment_plan_parser.add_argument("input", type=str, help="Input hypothesis text")
+    experiment_plan_parser.add_argument("hypothesis", type=str, help="Input hypothesis text")
     experiment_plan_parser.add_argument("yaml_map_path", type=Path, help="Path to the YAML map of vector stores")
+    experiment_plan_parser.add_argument("--context", type=str, help="Optional additional context for the hypothesis")
     experiment_plan_parser.add_argument("--model", type=str, default="openai/gpt-4", help="LLM model to use")
     experiment_plan_parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the LLM model")
-    experiment_plan_parser.add_argument("--out_md", type=Path, default=None, help="Output file to save the results (.md)")
+    experiment_plan_parser.add_argument("--output_folder", type=Path, required=True, help="Folder to save outputs")
+    experiment_plan_parser.add_argument("--prefix", type=str, default="experiment_plan", help="Prefix for output files")
 
     # Subcommand for generating a detailed experimental protocol
-    protocol_parser = subparsers.add_parser("generate_protocol", help="Generate a detailed experimental protocol from an experiment plan markdown file")
-    protocol_parser.add_argument("input_md", type=Path, help="Path to the experiment plan markdown file")
+    protocol_parser = subparsers.add_parser("generate_protocol", help="Generate a detailed experimental protocol from an experiment plan JSON")
+    protocol_parser.add_argument("input_json", type=Path, help="Path to the serialized experiment plan JSON")
     protocol_parser.add_argument("--model", type=str, default="openai/gpt-4", help="LLM model to use")
     protocol_parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the LLM model")
-    protocol_parser.add_argument("--out_md", type=Path, default=None, help="Output file to save the results (.md)")
+    protocol_parser.add_argument("--output_folder", type=Path, required=True, help="Folder to save outputs")
+    protocol_parser.add_argument("--prefix", type=str, default="protocol", help="Prefix for output files")
 
     return parser
 

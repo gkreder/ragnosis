@@ -5,8 +5,10 @@ from langchain.output_parsers import PydanticOutputParser, RetryOutputParser
 from langchain.prompts import PromptTemplate
 from langchain_core.output_parsers.string import StrOutputParser
 from langchain_core.runnables import RunnableLambda, RunnableParallel
+import json
 
 from ragnosis.aux import get_llm
+from ragnosis.models import Protocol
 
 class ProtocolEvaluation(BaseModel):
     """Evaluation results for a laboratory protocol"""
@@ -22,6 +24,13 @@ class ProtocolEvaluation(BaseModel):
         description="Score from 1-5 indicating how much the protocol makes sense. Does one step follow logically from the previous step? Does the protocol represent a complete set of steps that will succesfully test the hypothesis?",
         ge=1, le=5
     )
+    executability_score: int = Field(
+        description="Score from 1-5 evaluating if the protocol can be executed in the average yeast biology lab given the equipment needed. A score of 5 indicates that the protocol can easily be executed in an average yeast biology lab given its equipment. A score of 1 indicates that it would be impossible to execute in an average yeast biology lab.",
+        ge=1, le=5
+    )
+    executability_reasoning: str = Field(
+        description="Your reasoning behind the executability score."
+    )
     feedback: str = Field(
         description="Detailed feedback on the protocol's strengths and weaknesses"
     )
@@ -29,12 +38,12 @@ class ProtocolEvaluation(BaseModel):
         description="Specific suggestions for improving the protocol"
     )
 
-def evaluate_protocol(protocol_path: str, model: str = "openai/gpt-4", temperature: float = 0.0) -> Dict:
+def evaluate_protocol(protocol_json_path: Path, model: str = "openai/gpt-4", temperature: float = 0.0) -> Dict:
     """
-    Evaluates a protocol markdown file for executability and clarity.
+    Evaluates a protocol JSON file for executability and clarity.
     
     Args:
-        protocol_path: Path to the protocol markdown file
+        protocol_json_path: Path to the protocol JSON file (output from generate_protocol_flow)
         model: The LLM model to use for evaluation
         temperature: Temperature parameter for the LLM
         
@@ -44,9 +53,25 @@ def evaluate_protocol(protocol_path: str, model: str = "openai/gpt-4", temperatu
     # Create LLM instance
     llm = get_llm(model, kwargs={'temperature': temperature})
     
-    # Read the protocol
-    with open(protocol_path, 'r') as f:
-        protocol_content = f.read()
+    # Read and parse the protocol JSON
+    with open(protocol_json_path, 'r') as f:
+        protocol_dict = json.load(f)
+        protocol = Protocol(**protocol_dict)
+    
+    # Convert protocol to a formatted string for evaluation
+    protocol_content = []
+    for field_name, field_value in protocol.dict().items():
+        section_title = field_name.replace('_', ' ').title()
+        protocol_content.append(f"## {section_title}")
+        
+        if isinstance(field_value, str):
+            protocol_content.append(field_value)
+        elif isinstance(field_value, list):
+            for item in field_value:
+                protocol_content.append(f"- {item}")
+        protocol_content.append("")
+    
+    protocol_text = "\n".join(protocol_content)
     
     # Construct the evaluation prompt
     evaluation_template = """Please evaluate the following laboratory protocol for executability and clarity.
@@ -85,7 +110,7 @@ def evaluate_protocol(protocol_path: str, model: str = "openai/gpt-4", temperatu
     ) | RunnableLambda(lambda x: evaluation_retry_parser.parse_with_prompt(**x))
     
     # Run the evaluation
-    evaluation_results = evaluation_retry_chain.invoke({"protocol_content": protocol_content})
+    evaluation_results = evaluation_retry_chain.invoke({"protocol_content": protocol_text})
     
     return evaluation_results.dict()
 
@@ -94,14 +119,14 @@ if __name__ == "__main__":
     import json
     
     parser = argparse.ArgumentParser(description="Evaluate a protocol for executability")
-    parser.add_argument("protocol_path", help="Path to the protocol markdown file")
+    parser.add_argument("protocol_json_path", type=Path, help="Path to the protocol JSON file")
     parser.add_argument("--model", default="openai/gpt-4", help="Model to use for evaluation")
     parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the model")
-    parser.add_argument("--out_json", help="Optional path to save evaluation results as JSON")
+    parser.add_argument("--out_json", type=Path, help="Optional path to save evaluation results as JSON")
     
     args = parser.parse_args()
     
-    results = evaluate_protocol(args.protocol_path, args.model, args.temperature)
+    results = evaluate_protocol(args.protocol_json_path, args.model, args.temperature)
     
     if args.out_json:
         with open(args.out_json, 'w') as f:
