@@ -409,25 +409,54 @@ def generate_experiment_plan_flow(
 ) -> str:
     """Main flow to generate and ground an experiment plan"""
     
-    # First generate the experiment plan with entities
+    # First generate the restated hypothesis
     llm = get_llm(model, kwargs={'temperature': temperature})
     
-    plan_template = textwrap.dedent("""\
-    Given the following scientific hypothesis, generate a detailed experiment plan to test the hypothesis. \
-    For each field, extract key entities (techniques, reagents, controls, etc.) as a list.
+    restate_template = """\
+Clearly state the hypothesis, independent and dependent variables, any expected correlations,
+interactions, or causal relationships
 
-    {format_instructions}
+- Enhance Context-Gathering: Summarize known biological mechanisms, previous related
+studies, and whether prior experiments have yielded conflicting or inconclusive results.
+Highlight key knowledge gaps this research aims to address.
+
+- Clarify Sensitivity Requirements: Define acceptable detection limits, dynamic range, or
+measurement scales (e.g., molecular, subcellular, cellular, population level) necessary to
+validate the hypothesis.
+
+- Identify Potential Challenges: List anticipated technical or methodological challenges based
+on prior research in this domain (e.g., detection limitations, sample constraints, equipment
+availability).
+
+Original hypothesis: ```{hypothesis}```
+
+Restated hypothesis:"""
     
-    Hypothesis: ```{hypothesis}```
+    restate_prompt = PromptTemplate(
+        template=restate_template,
+        input_variables=["hypothesis"]
+    )
     
-    Response:""")
+    restate_chain = restate_prompt | llm | StrOutputParser()
+    restated_hypothesis = restate_chain.invoke({"hypothesis": input})
+    
+    # Then generate the experiment plan using the restated hypothesis
+    plan_template = """\
+Given the following scientific hypothesis, generate a detailed experiment plan to test the hypothesis. \
+For each field, extract key entities (techniques, reagents, controls, etc.) as a list.
+
+{format_instructions}
+
+Hypothesis: ```{restated_hypothesis}```
+
+Response:"""
     
     plan_parser = PydanticOutputParser(pydantic_object=ExperimentPlan)
     plan_retry_parser = RetryOutputParser.from_llm(parser=plan_parser, llm=llm)
     
     plan_prompt = PromptTemplate(
         template=plan_template,
-        input_variables=["hypothesis"],
+        input_variables=["restated_hypothesis"],
         partial_variables={"format_instructions": plan_parser.get_format_instructions()}
     )
     
@@ -437,7 +466,7 @@ def generate_experiment_plan_flow(
         prompt_value=plan_prompt
     ) | RunnableLambda(lambda x: plan_retry_parser.parse_with_prompt(**x))
     
-    experiment_plan = plan_retry_chain.invoke({"hypothesis": input})
+    experiment_plan = plan_retry_chain.invoke({"restated_hypothesis": restated_hypothesis})
     
     # Ground the entities in the plan
     grounded_plan = ground_experiment_plan(
@@ -447,34 +476,46 @@ def generate_experiment_plan_flow(
         temperature=temperature
     )
     
-    # Generate output
-    out_string = textwrap.dedent(f"""\
-    # Input Hypothesis
-    
-    {input}\n
-    
-    # Generated Experiment Plan\n""")
+    # Generate output - using list of strings to ensure proper formatting
+    output_parts = [
+        "# Input Hypothesis",
+        "",
+        input,
+        "",
+        "# Restated Hypothesis",
+        "",
+        restated_hypothesis,
+        "",
+        "# Generated Experiment Plan",
+        ""
+    ]
     
     # Handle all fields from the experiment plan
     for field_name, value in experiment_plan.dict().items():
-        out_string += f"## {field_name.replace('_', ' ').title()}\n\n"
+        output_parts.append(f"## {field_name.replace('_', ' ').title()}")
+        output_parts.append("")
         
         if isinstance(value, str):
             # Handle string fields
-            out_string += f"{value}\n\n"
+            output_parts.append(value)
+            output_parts.append("")
         elif isinstance(value, list):
             # Handle list fields
             if not value:
-                out_string += "No entities extracted\n\n"
+                output_parts.append("No entities extracted")
+                output_parts.append("")
                 continue
                 
             for entity in value:
-                out_string += f"### {entity}\n"
+                output_parts.append(f"### {entity}")
                 if field_name in grounded_plan and entity in grounded_plan[field_name]:
                     grounded_entity = grounded_plan[field_name][entity]
                     for k, v in grounded_entity.__dict__.items():
-                        out_string += f"- {k}: {v}\n"
-                out_string += "\n"
+                        output_parts.append(f"- {k}: {v}")
+                output_parts.append("")
+    
+    # Join all parts with newlines
+    out_string = "\n".join(output_parts)
     
     if out_md:
         out_md = Path(out_md)
