@@ -11,6 +11,7 @@ import pdfkit
 from typing import Dict, Tuple
 import yaml
 import json
+import pdb
 
 # Workaround for the OpenMP forking error - needs more permanent fix
 # See https://stackoverflow.com/questions/53014306/error-15-initializing-libiomp5-dylib-but-found-libiomp5-dylib-already-initial
@@ -275,6 +276,7 @@ def ground_experiment_plan(
     temperature: float = 0.0
 ) -> ExperimentPlan:
     """Ground each field in the ExperimentPlan to ontology terms based on the yaml mapping.
+    Only fields that appear in the yaml mapping will be grounded.
     Returns an updated ExperimentPlan with grounded entities.
     """
     
@@ -282,58 +284,57 @@ def ground_experiment_plan(
     yaml_map_path = Path(yaml_map_path)
     vector_store_map = load_vector_stores_yaml(yaml_map_path)
     
-    # Check yaml compatibility with ExperimentPlan fields
-    experiment_plan_keys = set(ExperimentPlan.__fields__.keys())
+    # Get the fields that should be grounded (those in the yaml mapping)
     yaml_keys = set(vector_store_map.keys())
-    if not yaml_keys.issubset(experiment_plan_keys):
-        raise ValueError(f"YAML contains unrecognized experiment plan object keys: {yaml_keys - experiment_plan_keys}")
     
     llm = get_llm(model, kwargs={'temperature': temperature})
     plan_dict = experiment_plan.dict()
     grounded_plan_dict = {}
     
-    # Ground each field's entities using the corresponding vector store
+    # Process each field in the experiment plan
     for field_name, value in plan_dict.items():
         if not value:  # Skip empty fields
             grounded_plan_dict[field_name] = value
             continue
-        if field_name not in yaml_keys:  # Skip fields that shouldn't be grounded
-            grounded_plan_dict[field_name] = value
-            continue
             
-        retriever = vector_store_map[field_name].as_retriever(search_kwargs={"k": RETRIEVER_TOP_K})
-        
-        if isinstance(value, list):
-            grounded_items = []
-            for item in value:
-                try:
-                    # Handle case where item might be a dict or string
-                    item_value = item['value'] if isinstance(item, dict) else str(item)
-                    
-                    # Get search term
-                    search_term = get_search_term(entity=item_value, llm=llm)
-                    
-                    # Ground entity using search term
-                    grounded_entity = ground_single_entity(
-                        entity=item_value,
-                        search_term=search_term,
-                        retriever=retriever,
-                        llm=llm
-                    )
-                    
-                    grounded_items.append(GroundedItem(
-                        value=item_value,
-                        grounding=grounded_entity
-                    ))
-                except Exception as e:
-                    logging.warning(f"Failed to ground item '{item}' in field '{field_name}': {e}")
-                    # If grounding fails, still include the item but without grounding
-                    grounded_items.append(GroundedItem(
-                        value=str(item),
-                        grounding=None
-                    ))
-            grounded_plan_dict[field_name] = grounded_items
+        # Only ground fields that appear in the yaml mapping
+        if field_name in yaml_keys:
+            retriever = vector_store_map[field_name].as_retriever(search_kwargs={"k": RETRIEVER_TOP_K})
+            
+            if isinstance(value, list):
+                grounded_items = []
+                for item in value:
+                    try:
+                        # Convert any string or dict item to string for grounding
+                        item_value = item['value'] if isinstance(item, dict) else str(item)
+                        
+                        # Get search term
+                        search_term = get_search_term(entity=item_value, llm=llm)
+                        
+                        # Ground entity using search term
+                        grounded_entity = ground_single_entity(
+                            entity=item_value,
+                            search_term=search_term,
+                            retriever=retriever,
+                            llm=llm
+                        )
+                        
+                        grounded_items.append(GroundedItem(
+                            value=item_value,
+                            grounding=grounded_entity
+                        ))
+                    except Exception as e:
+                        logging.warning(f"Failed to ground item '{item}' in field '{field_name}': {e}")
+                        # If grounding fails, still include the item but without grounding
+                        grounded_items.append(GroundedItem(
+                            value=str(item),
+                            grounding=None
+                        ))
+                grounded_plan_dict[field_name] = grounded_items
+            else:
+                grounded_plan_dict[field_name] = value
         else:
+            # For fields not in yaml mapping, keep the original value
             grounded_plan_dict[field_name] = value
             
     return ExperimentPlan(**grounded_plan_dict)
@@ -511,6 +512,47 @@ def save_markdown_and_pdf(output_parts: list[str], out_md: Path, out_pdf: Path):
         'margin-left': '20mm'
     })
 
+def parse_equipment_tsv(tsv_path: Path) -> str:
+    """Parse a TSV file containing equipment/reagent information into formatted sections.
+    
+    Expected TSV format:
+    Category    Item Name    Model/Manufacturer
+    
+    Returns:
+        Formatted string with sections for each category
+    """
+    # Clean the path string of any whitespace or carriage returns
+    tsv_path = Path(str(tsv_path).strip())
+    tsv_path = Path(tsv_path).resolve()  # Resolve to absolute path
+    
+    if not tsv_path.exists():
+        print(f"DEBUG: TSV path that doesn't exist: {tsv_path}")
+        print(f"DEBUG: Current working directory: {Path.cwd()}")
+        raise ValueError(f"TSV file not found: {tsv_path}")
+        
+    # Read TSV and group by category
+    categories = {}
+    with open(tsv_path, 'r') as f:
+        # Skip header
+        next(f)
+        for line in f:
+            category, item, model = line.strip().split('\t')
+            if category not in categories:
+                categories[category] = []
+            categories[category].append(f"- {item} : {model}")
+    
+    # Format into sections
+    sections = []
+    for category in sorted(categories.keys()):
+        sections.extend([
+            f"# Available {category} List",
+            "",
+            "\n".join(categories[category]),
+            ""
+        ])
+    
+    return "\n".join(sections)
+
 def generate_experiment_plan_flow(
     hypothesis: str,
     yaml_map_path: Path,
@@ -518,6 +560,7 @@ def generate_experiment_plan_flow(
     output_folder: Path,
     prefix: str,
     context: str = None,
+    equipment_tsv: Path = None,
     temperature: float = 0.0,
 ) -> Tuple[str, ExperimentPlan]:
     """Main flow to generate and ground an experiment plan
@@ -529,6 +572,7 @@ def generate_experiment_plan_flow(
         output_folder: Folder to save outputs
         prefix: Prefix for output files
         context: Optional additional context for the hypothesis
+        equipment_tsv: Optional path to TSV file with equipment/reagent information
         temperature: Temperature for LLM model
         
     Returns:
@@ -536,6 +580,7 @@ def generate_experiment_plan_flow(
     """
     
     # Create output directory if it doesn't exist
+    equipment_tsv = Path(equipment_tsv)
     output_folder = Path(output_folder)
     if not output_folder.exists():
         output_folder.mkdir(parents=True)
@@ -545,15 +590,22 @@ def generate_experiment_plan_flow(
     out_pdf = output_folder / f"{prefix}_experiment_plan.pdf"
     out_json = output_folder / f"{prefix}_experiment_plan.json"
     
-    # Combine hypothesis and context if provided
-    input_text = hypothesis
+    # Combine hypothesis, context, and equipment info if provided
+    sections = ["# Hypothesis", "", hypothesis, ""]
+    
     if context:
-        input_text = f"Hypothesis:\n{hypothesis}\n\nContext:\n{context}"
+        sections.extend(["# Context", "", context, ""])
+    
+    if equipment_tsv:
+        equipment_sections = parse_equipment_tsv(equipment_tsv)
+        if equipment_sections:
+            sections.append(equipment_sections)
+    
+    input_text = "\n".join(sections)
     
     # Generate the experiment plan using the hypothesis and context
     plan_template = """\
-Given the following input, generate a detailed experiment plan to test the hypothesis. \
-For each field, extract key entities (techniques, reagents, controls, etc.) as a list.
+Given the Hypothesis/Research Question/Research Objective, generate a detailed structured experiment plan optimized for testing this hypothesis. Use structured reasoning to ensure feasibility, accuracy, and reproducibility. Adapt the plan based on the experiment's key priorities and constraints, including any supplied inventory list (non-exhaustive list of available equipment and material/reagents).
 
 {format_instructions}
 
@@ -590,15 +642,20 @@ Response:"""
     
     # Generate markdown using the model-driven formatter
     output_parts = [
-        "# Input",
-        "",
-        input_text,
-        "",
+        # "# Input",
+        # "",
+        # "```",
+        # input_text,
+        # "```",
+        # "",
         "# Generated Experiment Plan",
         ""
     ]
     
     output_parts.extend(format_model_to_markdown(grounded_plan, level=2))
+
+    with open(output_folder / f"{prefix}_input.txt", "w") as f:
+        print(input_text, file=f)
     
     # Save outputs with proper formatting
     save_markdown_and_pdf(output_parts, out_md, out_pdf)
@@ -693,7 +750,7 @@ def generate_protocol_flow(
                     formatted_plan[field_name] = value
 
             protocol_template = textwrap.dedent("""\
-            Given the following experiment plan, generate a detailed laboratory protocol that would allow a technician to execute the experiment.
+            Given the Hypothesis and Experimental Plan, generate a detailed experimental protocol optimized for a lab technician.
             The protocol should be clear, actionable, and complete.
             When materials, equipment, or controls are mentioned in the protocol, try to use the same terms that were grounded in the experiment plan.
 
@@ -800,6 +857,7 @@ def get_parser():
     experiment_plan_parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the LLM model")
     experiment_plan_parser.add_argument("--output_folder", type=Path, required=True, help="Folder to save outputs")
     experiment_plan_parser.add_argument("--prefix", type=str, default="experiment_plan", help="Prefix for output files")
+    experiment_plan_parser.add_argument("--equipment_tsv", type=Path, help="Optional TSV file containing equipment and reagent information")
 
     # Subcommand for generating a detailed experimental protocol
     protocol_parser = subparsers.add_parser("generate_protocol", help="Generate a detailed experimental protocol from an experiment plan JSON")
