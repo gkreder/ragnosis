@@ -676,6 +676,7 @@ def generate_protocol_flow(
     model: str,
     output_folder: Path,
     prefix: str,
+    equipment_tsv: Path = None,
     temperature: float = 0.0,
 ) -> Tuple[str, Protocol]:
     """Generate a detailed experimental protocol from a serialized experiment plan
@@ -685,6 +686,7 @@ def generate_protocol_flow(
         model: LLM model to use
         output_folder: Folder to save outputs
         prefix: Prefix for output files
+        equipment_tsv: Optional path to TSV file with equipment/reagent information
         temperature: Temperature for LLM model
         
     Returns:
@@ -693,6 +695,8 @@ def generate_protocol_flow(
     
     # Create output directory if it doesn't exist
     output_folder = Path(output_folder)
+    if equipment_tsv:
+        equipment_tsv = Path(str(equipment_tsv).strip())
     if not output_folder.exists():
         output_folder.mkdir(parents=True)
     
@@ -716,6 +720,13 @@ def generate_protocol_flow(
             experiment_plan = ExperimentPlan(**experiment_plan_dict)
         
         logging.info("Successfully loaded experiment plan from JSON")
+        
+        # Log information about equipment TSV if provided
+        if equipment_tsv:
+            if equipment_tsv.exists():
+                logging.info(f"Using equipment information from: {equipment_tsv}")
+            else:
+                logging.warning(f"Equipment TSV file not found: {equipment_tsv}")
 
         # Create LLM instance
         logging.info(f"Initializing LLM model: {model} (temperature={temperature})")
@@ -748,20 +759,36 @@ def generate_protocol_flow(
                     formatted_plan[field_name] = formatted_items
                 else:
                     formatted_plan[field_name] = value
+            
+            # Get equipment information if provided
+            equipment_info = ""
+            if equipment_tsv and equipment_tsv.exists():
+                equipment_info = parse_equipment_tsv(equipment_tsv)
 
             protocol_template = textwrap.dedent("""\
             Given the Hypothesis and Experimental Plan, generate a detailed experimental protocol optimized for a lab technician.
             The protocol should be clear, actionable, and complete.
             When materials, equipment, or controls are mentioned in the protocol, try to use the same terms that were grounded in the experiment plan.
-
+            
             {format_instructions}
 
             Experiment Plan:
             ```
             {experiment_plan}
             ```
-
-            Response:""")
+            """)
+            
+            # Add equipment information to the template if available
+            if equipment_info:
+                protocol_template += textwrap.dedent(f"""\
+                Available Equipment and Materials:
+                ```
+                {equipment_info}
+                ```
+                """)
+                logging.info("Added equipment and materials information to the protocol template")
+            
+            protocol_template += "Response:"
             
             protocol_prompt = PromptTemplate(
                 template=protocol_template,
@@ -866,6 +893,7 @@ def get_parser():
     protocol_parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the LLM model")
     protocol_parser.add_argument("--output_folder", type=Path, required=True, help="Folder to save outputs")
     protocol_parser.add_argument("--prefix", type=str, default="protocol", help="Prefix for output files")
+    protocol_parser.add_argument("--equipment_tsv", type=Path, help="Optional TSV file containing equipment and reagent information")
 
     return parser
 
