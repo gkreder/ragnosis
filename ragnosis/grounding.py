@@ -880,7 +880,7 @@ def get_parser():
     experiment_plan_parser.add_argument("hypothesis", type=str, help="Input hypothesis text")
     experiment_plan_parser.add_argument("yaml_map_path", type=Path, help="Path to the YAML map of vector stores")
     experiment_plan_parser.add_argument("--context", type=str, help="Optional additional context for the hypothesis")
-    experiment_plan_parser.add_argument("--model", type=str, default="openai/gpt-4", help="LLM model to use")
+    experiment_plan_parser.add_argument("--model", type=str, default="openai/gpt-4o", help="LLM model to use")
     experiment_plan_parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the LLM model")
     experiment_plan_parser.add_argument("--output_folder", type=Path, required=True, help="Folder to save outputs")
     experiment_plan_parser.add_argument("--prefix", type=str, default="experiment_plan", help="Prefix for output files")
@@ -889,7 +889,7 @@ def get_parser():
     # Subcommand for generating a detailed experimental protocol
     protocol_parser = subparsers.add_parser("generate_protocol", help="Generate a detailed experimental protocol from an experiment plan JSON")
     protocol_parser.add_argument("input_json", type=Path, help="Path to the serialized experiment plan JSON")
-    protocol_parser.add_argument("--model", type=str, default="openai/gpt-4", help="LLM model to use")
+    protocol_parser.add_argument("--model", type=str, default="openai/gpt-4o", help="LLM model to use")
     protocol_parser.add_argument("--temperature", type=float, default=0.0, help="Temperature for the LLM model")
     protocol_parser.add_argument("--output_folder", type=Path, required=True, help="Folder to save outputs")
     protocol_parser.add_argument("--prefix", type=str, default="protocol", help="Prefix for output files")
